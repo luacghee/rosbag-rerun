@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosbag-rerun"
+version = "0.1.0"
+description = "ROS-independent rosbag reader and Rerun viewer"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["rosbags>=0.10,<1", "numpy>=1.26", "rerun-sdk>=0.38.1,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
