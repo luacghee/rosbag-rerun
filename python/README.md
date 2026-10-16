@@ -46,8 +46,11 @@ is its reference topic:
 python python/examples/sync_bag.py path/to/recording.bag \
   --group camera_imu /camera /imu \
   --group camera_pose /camera /pose \
-  --tolerance-ms 10 --limit 5
+  --tolerance-ms 10 --timestamp-source header --limit 5
 ```
+
+Use `--timestamp-source bag` for recorded timestamps. The example also accepts
+`--max-out-of-order-ms` when header timestamps arrive out of order.
 
 Both scripts process messages as fast as they can by default. Add `--pace` to
 wait according to the bag timestamps, or `--limit 0` to process the entire bag.
@@ -118,6 +121,7 @@ groups = [
         topics=("/camera", "/imu"),
         reference_topic="/camera",
         tolerance_ns=10_000_000,
+        timestamp_source="header",  # use "bag" for recorded timestamps
     ),
     SyncGroup(
         name="camera_pose",
@@ -133,7 +137,12 @@ with ROSBagReader("data/local/recording.bag") as bag:
 ```
 
 Each set matches the nearest available message from its other topics within
-`tolerance_ns` of the reference message's **bag timestamp**. A topic may belong to
+`tolerance_ns` of the reference message's selected timestamp. `timestamp_source`
+defaults to `"bag"`; choose `"header"` for sensor capture times. Header matching
+requires deserialized messages with `header.stamp` and buffers up to
+`max_out_of_order_ns` (200 ms by default) of header-time reordering. Increase
+that bound if the bag delivers older headers later; input must still be in
+nondecreasing bag-time order. A topic may belong to
 multiple groups; each group consumes messages independently. A message is used
 at most once per topic within a group. Incomplete groups are skipped. Bundles
 are emitted after the tolerance window has passed, or at end of bag, and are
