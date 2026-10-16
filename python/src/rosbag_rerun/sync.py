@@ -20,6 +20,7 @@ class SyncGroup:
     max_queue_size: int = 1000
     timestamp_source: str = "bag"
     max_out_of_order_ns: int = 200_000_000
+    reorder_by_timestamp: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "topics", tuple(self.topics))
@@ -65,25 +66,33 @@ def _timestamp_ns(message: BagMessage, source: str) -> int:
 class _GroupState:
     def __init__(self, config: SyncGroup) -> None:
         self.config = config
-        # Sorted by the selected event time, even when bag order differs.
+        # Queues retain input order by default; timestamp mode keeps them sorted.
         self.queues: dict[str, list[tuple[int, int, BagMessage]]] = {
             topic: [] for topic in config.topics
         }
         self.latest_ns: int | None = None
+        self.latest_bag_ns: int | None = None
         self.sequence = 0
 
     def add(self, message: BagMessage) -> None:
         if message.topic not in self.queues:
             return
         timestamp_ns = _timestamp_ns(message, self.config.timestamp_source)
-        if self.latest_ns is not None and timestamp_ns < self.latest_ns - self.config.max_out_of_order_ns:
+        if (self.config.reorder_by_timestamp and self.latest_ns is not None
+                and timestamp_ns < self.latest_ns - self.config.max_out_of_order_ns):
             if self.config.timestamp_source == "header":
                 raise ValueError(
                     f"Header timestamp on {message.topic} arrived more than "
                     f"{self.config.max_out_of_order_ns} ns out of order; increase max_out_of_order_ns"
                 )
         self.latest_ns = max(timestamp_ns, self.latest_ns or timestamp_ns)
-        insort(self.queues[message.topic], (timestamp_ns, self.sequence, message))
+        self.latest_bag_ns = max(message.bag_timestamp_ns,
+                                 self.latest_bag_ns or message.bag_timestamp_ns)
+        item = (timestamp_ns, self.sequence, message)
+        if self.config.reorder_by_timestamp:
+            insort(self.queues[message.topic], item)
+        else:
+            self.queues[message.topic].append(item)
         self.sequence += 1
         if len(self.queues[message.topic]) > self.config.max_queue_size:
             self.queues[message.topic].pop(0)
@@ -92,12 +101,20 @@ class _GroupState:
         config = self.config
         if self.latest_ns is None:
             return []
-        watermark_ns = (float("inf") if finish else
-                        self.latest_ns - config.tolerance_ns -
-                        (config.max_out_of_order_ns if config.timestamp_source == "header" else 0))
+        if finish:
+            watermark_ns = float("inf")
+        elif config.reorder_by_timestamp:
+            watermark_ns = (self.latest_ns - config.tolerance_ns -
+                            (config.max_out_of_order_ns if config.timestamp_source == "header" else 0))
+        else:
+            # Preserve bag iteration order. Wait in bag time for nearby partner
+            # messages, but never sort the reference stream by its header time.
+            watermark_ns = self.latest_bag_ns - config.tolerance_ns
         reference_queue = self.queues[config.reference_topic]
         ready: list[SyncedMessage] = []
-        while reference_queue and reference_queue[0][0] <= watermark_ns:
+        while reference_queue and (
+                reference_queue[0][0] <= watermark_ns if config.reorder_by_timestamp
+                else reference_queue[0][2].bag_timestamp_ns <= watermark_ns):
             timestamp_ns, _, reference = reference_queue.pop(0)
             matched: dict[str, BagMessage] = {config.reference_topic: reference}
             selected_indices: dict[str, int] = {}
@@ -128,7 +145,7 @@ class _GroupState:
                     messages={topic: matched[topic] for topic in config.topics},
                 ))
 
-        if not finish:
+        if not finish and config.reorder_by_timestamp:
             cutoff_ns = watermark_ns - config.tolerance_ns
             for topic, queue in self.queues.items():
                 if topic != config.reference_topic:
@@ -168,7 +185,10 @@ class MessageSynchronizer:
 
     def _drain(self, finish: bool = False) -> list[SyncedMessage]:
         ready = [item for group in self._groups for item in group.drain(finish)]
-        ready.sort(key=lambda item: item.timestamp_ns)
+        if all(group.config.reorder_by_timestamp for group in self._groups):
+            ready.sort(key=lambda item: item.timestamp_ns)
+        elif not any(group.config.reorder_by_timestamp for group in self._groups):
+            ready.sort(key=lambda item: item.bag_timestamp_ns)
         return ready
 
 
@@ -176,7 +196,7 @@ def iter_synchronized(
     messages: Iterable[BagMessage],
     groups: Iterable[SyncGroup],
 ) -> Iterator[SyncedMessage]:
-    """Yield complete groups in reference-time order; unmatched data is skipped."""
+    """Yield complete groups in bag order by default; timestamp sorting is opt-in."""
     synchronizer = MessageSynchronizer(groups)
     for message in messages:
         yield from synchronizer.add(message)
