@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from rosbag_rerun import BagMessage, MessageSynchronizer, SyncGroup, iter_synchronized
 
@@ -104,3 +105,76 @@ class SynchronizerTest(unittest.TestCase):
             MessageSynchronizer([group, group])
         with self.assertRaises(ValueError):
             SyncGroup(name="empty", topics=(), reference_topic="/camera")
+
+
+class ArrivalWaitTest(unittest.TestCase):
+    @staticmethod
+    def record(topic, bag_ns, header_ns):
+        sec, nanosec = divmod(header_ns, 1_000_000_000)
+        payload = SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=nanosec)))
+        return msg(topic, bag_ns, payload)
+
+    def group(self, **options):
+        return SyncGroup(name='rgbd', topics=('rgb', 'depth'), reference_topic='rgb',
+                         timestamp_source='header', **options)
+
+    def test_delayed_exact_pairs_keep_bag_order_without_widening_tolerance(self):
+        records = []
+        for i in range(4):
+            stamp = 1_000_000_000 + i * 33_000_000
+            records.extend([self.record('rgb', stamp, stamp),
+                            self.record('depth', stamp + 55_000_000, stamp)])
+        records.sort(key=lambda record: record.bag_timestamp_ns)
+        result = list(iter_synchronized(records, [self.group()]))
+        self.assertEqual([bundle.timestamp_ns for bundle in result],
+                         [1_000_000_000 + i * 33_000_000 for i in range(4)])
+        self.assertTrue(all(bundle.messages['rgb'].message.header.stamp ==
+                            bundle.messages['depth'].message.header.stamp for bundle in result))
+        legacy = list(iter_synchronized(records, [self.group(arrival_wait_ns=30_000_000)]))
+        self.assertLess(len(legacy), len(result))
+
+    def test_header_tolerance_still_rejects_bad_timestamp_matches(self):
+        records = [self.record('rgb', 0, 1_000_000_000),
+                   self.record('depth', 50_000_000, 1_031_000_000)]
+        self.assertEqual(list(iter_synchronized(records, [self.group()])), [])
+
+    def test_late_partner_is_rejected_even_when_it_advances_the_deadline(self):
+        records = [self.record('rgb', 0, 1_000_000_000),
+                   self.record('depth', 200_000_001, 1_000_000_000)]
+        self.assertEqual(list(iter_synchronized(records, [self.group()])), [])
+
+    def test_partner_at_deadline_is_accepted(self):
+        records = [self.record('rgb', 0, 1_000_000_000),
+                   self.record('depth', 200_000_000, 1_000_000_000)]
+        self.assertEqual(len(list(iter_synchronized(records, [self.group()]))), 1)
+
+    def test_unrelated_topics_advance_timeout_without_blocking_later_frames(self):
+        records = [self.record('rgb', 0, 1_000_000_000),
+                   msg('imu', 200_000_000),
+                   self.record('depth', 210_000_000, 1_000_000_000),
+                   self.record('rgb', 220_000_000, 1_220_000_000),
+                   self.record('depth', 250_000_000, 1_220_000_000)]
+        result = list(iter_synchronized(records, [self.group()]))
+        self.assertEqual([bundle.timestamp_ns for bundle in result], [1_220_000_000])
+
+    def test_waits_for_closer_partner_and_consumes_it_once(self):
+        records = [self.record('rgb', 0, 1_000_000_000),
+                   self.record('depth', 10_000_000, 990_000_000),
+                   self.record('depth', 55_000_000, 1_000_000_000)]
+        result = list(iter_synchronized(records, [self.group()]))
+        self.assertEqual(result[0].messages['depth'].bag_timestamp_ns, 55_000_000)
+
+    def test_explicit_reordering_keeps_its_own_header_watermark(self):
+        records = [self.record('rgb', 0, 1_200_000_000),
+                   self.record('depth', 10_000_000, 1_200_000_000),
+                   self.record('rgb', 20_000_000, 1_000_000_000),
+                   self.record('depth', 30_000_000, 1_000_000_000)]
+        group = self.group(reorder_by_timestamp=True, max_out_of_order_ns=200_000_000,
+                           arrival_wait_ns=1)
+        result = list(iter_synchronized(records, [group]))
+        self.assertEqual([bundle.timestamp_ns for bundle in result], [1_000_000_000, 1_200_000_000])
+
+    def test_invalid_arrival_wait_is_rejected(self):
+        for value in (-1, 1.5, True, float('inf')):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'arrival_wait_ns'):
+                self.group(arrival_wait_ns=value)

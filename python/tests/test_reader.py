@@ -46,6 +46,7 @@ class ROSBagReaderTest(unittest.TestCase):
                                 topics=("/first", "/second"),
                                 reference_topic="/first",
                                 tolerance_ns=1_000_000_000,
+                                arrival_wait_ns=1_000_000_000,
                             )
                         ]
                     )

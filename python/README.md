@@ -121,6 +121,7 @@ groups = [
         topics=("/camera", "/imu"),
         reference_topic="/camera",
         tolerance_ns=10_000_000,
+        arrival_wait_ns=200_000_000,
         timestamp_source="header",  # use "bag" for recorded timestamps
     ),
     SyncGroup(
@@ -139,15 +140,23 @@ with ROSBagReader("data/local/recording.bag") as bag:
 Each set matches the nearest available message from its other topics within
 `tolerance_ns` of the reference message's selected timestamp. `timestamp_source`
 defaults to `"bag"`; choose `"header"` for sensor capture times. Header matching
-requires deserialized messages with `header.stamp` and buffers up to
-`max_out_of_order_ns` (200 ms by default) of header-time reordering. Increase
-that bound if the bag delivers older headers later; input must still be in
-nondecreasing bag-time order. A topic may belong to
-multiple groups; each group consumes messages independently. A message is used
-at most once per topic within a group. Incomplete groups are skipped. Bundles
-are emitted after the tolerance window has passed, or at end of bag, and are
-ordered by reference timestamp. `iter_synchronized` also accepts any
-chronologically ordered `BagMessage` iterable if the source is not a bag reader.
+requires deserialized messages with `header.stamp`. By default, messages stay in
+bag order. `arrival_wait_ns` (200 ms by default) independently bounds how long a
+reference waits in bag time for its partner messages. Increasing it accommodates
+recording delays without changing `tolerance_ns` or sorting messages. Partners
+recorded after that deadline are ineligible even if their headers match. Other
+topics also advance the deadline, and EOF flushes complete eligible groups.
+
+With `reorder_by_timestamp=True`, the timestamp watermark instead buffers up to
+`max_out_of_order_ns` (200 ms by default) of header-time reordering; the bag-order
+arrival deadline does not apply. Increase that bound if the bag delivers older
+headers later. Input must always remain in nondecreasing bag-time order. A topic
+may belong to multiple groups; each consumes messages independently. A message
+is used at most once per topic within a group. Incomplete groups are skipped.
+Bundles are emitted after their arrival wait (or the timestamp watermark when
+reordering), or at end of bag. Output follows reference bag order unless
+reordering is enabled. `iter_synchronized` also accepts any chronologically
+ordered `BagMessage` iterable if the source is not a bag reader.
 
 ## Optional recorded-speed playback
 

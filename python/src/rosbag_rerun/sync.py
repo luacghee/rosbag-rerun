@@ -21,6 +21,7 @@ class SyncGroup:
     timestamp_source: str = "bag"
     max_out_of_order_ns: int = 200_000_000
     reorder_by_timestamp: bool = False
+    arrival_wait_ns: int = 200_000_000
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "topics", tuple(self.topics))
@@ -38,6 +39,8 @@ class SyncGroup:
             raise ValueError("timestamp_source must be 'bag' or 'header'")
         if self.max_out_of_order_ns < 0:
             raise ValueError("max_out_of_order_ns must be nonnegative")
+        if type(self.arrival_wait_ns) is not int or self.arrival_wait_ns < 0:
+            raise ValueError("arrival_wait_ns must be a nonnegative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +78,9 @@ class _GroupState:
         self.sequence = 0
 
     def add(self, message: BagMessage) -> None:
+        # Every bag record advances arrival deadlines, including other topics.
+        self.latest_bag_ns = max(message.bag_timestamp_ns,
+                                 self.latest_bag_ns or message.bag_timestamp_ns)
         if message.topic not in self.queues:
             return
         timestamp_ns = _timestamp_ns(message, self.config.timestamp_source)
@@ -86,8 +92,6 @@ class _GroupState:
                     f"{self.config.max_out_of_order_ns} ns out of order; increase max_out_of_order_ns"
                 )
         self.latest_ns = max(timestamp_ns, self.latest_ns or timestamp_ns)
-        self.latest_bag_ns = max(message.bag_timestamp_ns,
-                                 self.latest_bag_ns or message.bag_timestamp_ns)
         item = (timestamp_ns, self.sequence, message)
         if self.config.reorder_by_timestamp:
             insort(self.queues[message.topic], item)
@@ -109,7 +113,7 @@ class _GroupState:
         else:
             # Preserve bag iteration order. Wait in bag time for nearby partner
             # messages, but never sort the reference stream by its header time.
-            watermark_ns = self.latest_bag_ns - config.tolerance_ns
+            watermark_ns = self.latest_bag_ns - config.arrival_wait_ns
         reference_queue = self.queues[config.reference_topic]
         ready: list[SyncedMessage] = []
         while reference_queue and (
@@ -125,6 +129,8 @@ class _GroupState:
                 candidates = (
                     (index, item) for index, item in enumerate(queue)
                     if abs(item[0] - timestamp_ns) <= config.tolerance_ns
+                    and (config.reorder_by_timestamp or
+                         item[2].bag_timestamp_ns <= reference.bag_timestamp_ns + config.arrival_wait_ns)
                 )
                 nearest = min(
                     candidates,
